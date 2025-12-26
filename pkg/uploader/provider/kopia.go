@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strings"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/kopia/kopia/snapshot/upload"
 	"github.com/pkg/errors"
@@ -253,6 +254,11 @@ func (kp *kopiaProvider) RunRestore(
 	output := fmt.Sprintf("Kopia restore finished, restore size %d, file count %d", size, fileCount)
 
 	log.Info(output)
+
+	// Sync filesystem to ensure all data is written to disk
+	log.Info("Syncing filesystem to ensure data is persisted")
+	syscall.Sync()
+	log.Info("Filesystem sync completed")
 
 	return size, nil
 }

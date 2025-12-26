@@ -19,6 +19,7 @@ package exposer
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/pkg/errors"
@@ -368,6 +369,13 @@ func (e *podVolumeExposer) createHostingPod(
 	podInfo, err := getInheritedPodInfo(ctx, e.kubeClient, ownerObject.Namespace, nodeOS)
 	if err != nil {
 		return nil, errors.Wrap(err, "error to get inherited pod info from node-agent")
+	}
+
+	// Override image if environment variable is set
+	customImage := os.Getenv("VELERO_DATA_MOVER_IMAGE")
+	if customImage != "" {
+		e.log.Infof("Overriding data mover image from %s to %s", podInfo.image, customImage)
+		podInfo.image = customImage
 	}
 
 	// Log the priority class if it's set

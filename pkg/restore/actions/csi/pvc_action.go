@@ -155,7 +155,7 @@ func (p *pvcRestoreItemAction) Execute(
 			logger.Infof("DataDownload %s/%s is created successfully.",
 				dataDownload.Namespace, dataDownload.Name)
 		} else {
-			//CSI restore
+			// CSI restore.
 			vsName, nameOK := pvcFromBackup.Annotations[velerov1api.VolumeSnapshotLabel]
 			if !nameOK {
 				logger.Info("Skipping PVCRestoreItemAction for PVC, PVC does not have a CSI VolumeSnapshot.")
@@ -164,8 +164,8 @@ func (p *pvcRestoreItemAction) Execute(
 				}, nil
 			}
 
-			//To avoid confilcs, vs and vsc get a new uniq name based in restore UID
-			// and vs name old name
+			// To avoid conflicts, vs and vsc get new unique names based on
+			// restore UID and original vs name.
 			newVSName := util.GenerateSha256FromRestoreUIDAndVsName(string(input.Restore.UID), vsName)
 
 			p.log.Debugf("Setting PVC source to VolumeSnapshot new name: %s", newVSName)
@@ -173,7 +173,7 @@ func (p *pvcRestoreItemAction) Execute(
 
 			additionalItems = append(additionalItems, velero.ResourceIdentifier{
 				GroupResource: kuberesource.VolumeSnapshots,
-				Name:          vsName,
+				Name:          newVSName,
 				Namespace:     pvc.Namespace,
 			})
 		}

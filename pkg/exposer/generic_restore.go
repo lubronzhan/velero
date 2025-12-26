@@ -374,8 +374,13 @@ func (e *genericRestoreExposer) CleanUp(ctx context.Context, ownerObject corev1a
 	restorePVCName := ownerObject.Name
 	cachePVCName := getCachePVCName(ownerObject)
 
-	kube.DeletePodIfAny(ctx, e.kubeClient.CoreV1(), restorePodName, ownerObject.Namespace, e.log)
+	curLog := e.log
+
+	curLog.WithField("pod name", restorePodName).Info("Cleaning up restore pod")
+	kube.DeletePodIfAny(ctx, e.kubeClient.CoreV1(), restorePodName, ownerObject.Namespace, curLog)
+	curLog.WithField("restore PVC name", restorePVCName).Info("Cleaning up restore PVC")
 	kube.DeletePVAndPVCIfAny(ctx, e.kubeClient.CoreV1(), restorePVCName, ownerObject.Namespace, 0, e.log)
+	curLog.WithField("cache PVC name", cachePVCName).Info("Cleaning up cache PVC")
 	kube.DeletePVAndPVCIfAny(ctx, e.kubeClient.CoreV1(), cachePVCName, ownerObject.Namespace, 0, e.log)
 }
 
@@ -599,7 +604,8 @@ func (e *genericRestoreExposer) createRestorePod(
 			RunAsUser: &userID,
 		}
 
-		nodeSelector[kube.NodeOSLabel] = kube.NodeOSLinux
+		// Disable node selector.
+		// nodeSelector[kube.NodeOSLabel] = kube.NodeOSLinux
 		podOS.Name = kube.NodeOSLinux
 	}
 

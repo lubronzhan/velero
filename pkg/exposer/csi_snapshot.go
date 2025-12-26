@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/vmware-tanzu/velero/pkg/nodeagent"
@@ -259,13 +260,7 @@ func (e *csiSnapshotExposer) Expose(ctx context.Context, ownerObject corev1api.O
 		return errors.Wrap(err, "error to create backup pod")
 	}
 
-	curLog = curLog.WithField("pod name", backupPod.Name)
-	if affinity != nil {
-		curLog = curLog.WithField("affinity", *affinity)
-	} else {
-		curLog = curLog.WithField("affinity", "nil")
-	}
-	curLog.Info("Backup pod is created")
+	curLog.WithField("pod name", backupPod.Name).WithField("affinity", affinity).Info("Backup pod is created")
 
 	defer func() {
 		if err != nil {
@@ -325,16 +320,16 @@ func (e *csiSnapshotExposer) GetExposed(ctx context.Context, ownerObject corev1a
 
 	curLog.WithField("pod", pod.Name).Infof("Backup volume is found in pod at index %v", i)
 
-	var nodeOS *string
-	if os, found := pod.Spec.NodeSelector[kube.NodeOSLabel]; found {
-		nodeOS = &os
-	}
+	// var nodeOS *string
+	// if os, found := pod.Spec.NodeSelector[kube.NodeOSLabel]; found {
+	// 	nodeOS = &os
+	// }
 
 	return &ExposeResult{ByPod: ExposeByPod{
 		HostingPod:       pod,
 		HostingContainer: containerName,
 		VolumeName:       volumeName,
-		NodeOS:           nodeOS,
+		NodeOS:           ptr.To("linux"), // hardcoded to linux for now
 	}}, nil
 }
 
@@ -739,9 +734,9 @@ func (e *csiSnapshotExposer) createBackupPod(
 					},
 				},
 			},
-			NodeSelector: nodeSelector,
-			OS:           &podOS,
-			Affinity:     podAffinity,
+			// NodeSelector: nodeSelector,
+			OS:       &podOS,
+			Affinity: podAffinity,
 			Containers: []corev1api.Container{
 				{
 					Name:            containerName,
