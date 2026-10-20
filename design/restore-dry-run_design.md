@@ -173,7 +173,7 @@ A preview with such gaps must not be presented as a fully evaluated restore, whe
 ### Plugin contract
 
 The Restore already travels in `RestoreItemActionExecuteInput`, so updated plugins can check `input.Restore.Spec.DryRun != nil && input.Restore.Spec.DryRun.Enabled` without a separate execution-mode RPC.
-No capability RPC or new plugin interface is required in the initial implementation; the additive metadata input described below is needed for built-in CSI data-mover planning.
+No capability RPC or new plugin interface is required in the initial implementation; the optional metadata input described below is needed for built-in CSI data-mover planning.
 For every dry run, load, resolve, and execute applicable built-in restore actions in dry-run mode.
 Classify actions using server-owned registration provenance and the resolved plugin executable, rather than a plugin's name or `velero.io/` prefix.
 Retain the registry's existing rejection of duplicate kind/name registrations; do not introduce external overrides or silently substitute a built-in implementation for a skipped external action.
@@ -200,64 +200,20 @@ The flag is not a sandbox: plugins remain trusted code with their existing crede
 
 ### Adapting built-in restore actions
 
-Keeping built-in actions enabled requires preserving their planning decisions while separating those decisions from execution.
-Do not return early from every action merely because dry run is enabled: that would lose transformations, dependencies, and `SkipRestore` behavior.
-Use a shared nil-safe helper for checking `Restore.Spec.DryRun.Enabled`, and keep ordinary restore execution paths unchanged.
+Built-in actions should check dry-run mode while preserving read-only lookups, in-memory resource transformations, additional items, and `SkipRestore` decisions.
+For example, PVC and pod-to-PVC actions can continue selecting dependencies, and hook actions can update the planned pod definition without running containers.
 
-| Built-in action | Existing behavior | Proposed dry-run handling |
-| --- | --- | --- |
-| Generic PVC (`pkg/restore/actions/pvc_action.go`) | Removes binding annotations, reads PodVolumeBackups, resets binding information, and returns a bound PV as an additional item where appropriate. | Preserve read-only lookups, in-memory transformations, and additional items; the core planner evaluates the returned PV without restoring it. |
-| Pod-to-PVC (`add_pvc_from_pod_action.go`) | Returns PVCs referenced by a pod as additional items. | Run normally and traverse the dependencies through the planner. |
-| Pod volume restore and init hooks | Read configuration and backup metadata, then inject init containers into the returned pod definition. | Preserve configuration validation and in-memory pod changes; report intended hooks and volume restore steps without creating the pod, PodVolumeRestores, or running containers or exec hooks. |
-| CSI PVC without data movement (`actions/csi/pvc_action.go`) | Changes the PVC's data source to the restored snapshot and returns that snapshot as an additional item. | Preserve existing-PVC decisions, deterministic snapshot references, transformations, and additional-item/must-include behavior; plan snapshot dependencies without creating them. |
-| DataUpload retrieval (`dataupload_retrieve_action.go`) | Converts an archived DataUpload into DataUploadResult metadata, creates a ConfigMap containing it, and returns SkipRestore. | Compute and validate the same metadata, retain SkipRestore, and supply the metadata through the in-memory planning input described below; do not create a ConfigMap. |
-| CSI PVC with data movement | Reads the DataUploadResult ConfigMap, runs preflight checks, may snapshot and delete an existing PVC, creates a DataDownload, and returns an OperationID. | Obtain metadata from planning input, run read-only preflight checks, and record intended operations; do not create snapshots or DataDownloads, delete PVCs, wait for readiness, or return an OperationID. |
-| CSI VolumeSnapshot (`actions/csi/volumesnapshot_action.go`) | Renames and transforms the snapshot, returns its content as an additional item, and can create or update a stub VolumeGroupSnapshotContent. | Preserve transformations and dependencies; record stub creation or handle updates as intentions without issuing create, update, or status-update calls. |
-| Other built-in transformations | Adjust resource definitions or use read-only configuration/cluster queries. | Preserve those operations after auditing direct calls and helper calls for writes; any mutation requires an explicit planning branch. |
+CSI actions need explicit planning branches before snapshot creation, PVC deletion, DataDownload submission, or snapshot-group updates.
+These branches record intended operations without writes, cleanup calls, readiness waits, or asynchronous OperationIDs.
+Incremental restore outcomes that depend on snapshot execution remain conditional in the preview.
 
-#### Pass DataUpload metadata without a ConfigMap
+DataUpload metadata currently passes between actions through a ConfigMap.
+During dry run, derive the same metadata from the selected backup items and retain it in memory, preserving source identities, filters, and processing order.
+Use this metadata for both the CSI PVC action and the core PV lookup in `hasSnapshotDataUpload`, including older backups without BackupVolumeInfo.
+Pass per-PVC metadata across the existing plugin RPC through an optional Execute input field instead of creating a ConfigMap, and bypass its cleanup writes.
+Missing or ambiguous metadata is an evaluation error; ordinary restores retain their existing behavior.
 
-The current DataUpload retrieval action and CSI PVC data-mover action communicate through a ConfigMap in the Velero namespace.
-Skipping the ConfigMap write alone would cause `getDataUploadResult` to fail, so both producer and consumer must change together.
-This proposal keeps that ConfigMap out of the permitted preview bookkeeping writes and supplies the required metadata through action input instead.
-
-Extract a shared conversion helper that builds a `v2alpha1.DataUploadResult` from an archived DataUpload and its Backup metadata.
-Use the same conversion for ordinary ConfigMap production and dry-run planning, including data mover, snapshot ID, size, snapshot class, source namespace, filesystem, and mover-specific results.
-After archive extraction, prepare an in-memory index of these results using original source namespace/PVC identity and the archived DataUpload identity.
-Respect the normal DataUpload selection, resource filters, and processing order when making indexed entries available; this preparation must not silently include metadata from a DataUpload the corresponding real restore would exclude.
-Resolve the PVC's archived DataUpload reference before namespace mapping and report missing or ambiguous metadata as an item evaluation error.
-Do not fall back to an unrelated live ConfigMap or assume an empty volume restore when metadata is unavailable.
-
-Add an optional `DryRunDataUploadResult *v2alpha1.DataUploadResult` field to `RestoreItemActionExecuteInput`.
-Populate it only for the built-in CSI PVC action during an enabled dry run, with a copy of the result for that PVC.
-Built-in actions run through plugin RPC, so a controller-local map alone is insufficient.
-Add a `bytes dryRunDataUploadResult = 5` field containing the JSON-encoded result to Execute requests in both current protocol versions, and thread it through framework clients, servers, version adapters, and restartable wrappers.
-This is an additive request field, not a new RPC or a required method on the plugin author interfaces.
-Leave it unset for ordinary restores and external actions, and regenerate the protocol bindings.
-The CSI PVC action uses this input in dry-run mode and keeps its existing ConfigMap lookup for ordinary restores.
-The DataUpload retrieval action still validates its selected archived input and returns SkipRestore during a preview, but performs no ConfigMap write.
-The index is scoped to one processing attempt and can be rebuilt from the backup; do not put it in Restore status, annotations, logs, or preview artifacts.
-
-#### Separate CSI planning from volume execution
-
-In the CSI PVC data-mover path, separate metadata lookup and read-only preflight from snapshot creation, PVC deletion, DataDownload submission, cleanup, and operation tracking.
-Place the dry-run branch after the checks that can be evaluated from archive metadata and existing resources, but before the first mutation, including deferred cleanup registration.
-Return the transformed PVC and log the intended data operation with an empty OperationID.
-For incremental in-place restore, report baseline snapshot creation and possible full-restore fallback as conditional intentions; snapshot readiness and changed-block availability cannot be established without execution.
-Do not claim that incremental restoration is guaranteed or wait for the baseline snapshot during planning.
-
-In the VolumeSnapshot action, split stub VolumeGroupSnapshotContent calculation from persistence.
-Compute the deterministic stub name and required handles in memory, merge planned handles for snapshots sharing a stub, and record whether an existing stub would need an update.
-Bypass `CreateVGSC`, `UpdateVGSC`, `UpdateVGSCStatus`, and associated retry or cleanup work while retaining the snapshot/content transformations and dependencies.
-Core readiness and finalizer code must also bypass waits and mutations for these planned objects.
-
-#### Verify built-in action behavior
-
-For each action above, compare its returned object, additional items, and SkipRestore decisions between preview and ordinary execution using equivalent input and cluster fixtures, allowing for unresolved execution-generated values.
-Use clients that reject all write verbs and fakes that reject snapshot allocation, PVC deletion, data-transfer submission, and hook execution during preview.
-Include DataUpload-to-CSI integration across the actual RPC serialization and version adapters, verifying that the consumer receives the correct source PVC metadata with zero ConfigMap writes.
-Test namespace mapping, excluded or missing DataUploads, malformed or ambiguous metadata, multiple restores in one plugin process, and ordinary restore regression behavior.
-These tests are required before built-in actions can be considered safe to always execute in preview mode.
+Verify that built-in actions preserve planning decisions while issuing no application or volume writes, including the DataUpload-to-CSI and retained-PV paths.
 
 ### Results and lifecycle
 
@@ -355,7 +311,7 @@ Verification must cover:
 - Existing-resource policies, ServiceAccount merging, status restoration, labels, managed fields, generated names, and missing or terminating namespaces with the informer cache enabled and disabled.
 - Native snapshots, CSI snapshots and data movement, file-system restore, dynamic provisioning, and in-place restore, including existing PVCs and read-only preflight failures.
 - Built-in PVC and CSI action execution with external execution disabled, preserving transformations and dependencies while issuing zero application or volume mutations.
-- DataUpload metadata producer/consumer parity, per-PVC Execute input serialization through both protocol versions and adapters, and CSI data-mover planning without ConfigMap creation or lookup.
+- DataUpload metadata parity for CSI PVC and core PV planning, including older retained-PV backups, RPC transport, and zero ConfigMap writes.
 - Zero external restore-action loading, selector resolution, or execution when external actions are skipped, with omission warnings, action names, and visible mode indicators in persisted and CLI output; no omission warning when no external actions are registered.
 - Registration provenance, continued rejection of duplicate built-in kind/name registrations, and external actions using the velero.io prefix, ensuring names alone cannot bypass external opt-in.
 - Opt-in execution for both plugin protocol versions with dry-run-aware actions, SkipRestore, additional items, and erroneous OperationIDs; ordinary restores still execute applicable actions when the dryRun configuration is absent or disabled.
