@@ -22,7 +22,7 @@ As a result, adding a conditional check around `resourceClient.Create` would be 
 ## Goals
 
 - Preview selected resources and intended create, update, and skip decisions using core restore rules and built-in actions, with optional external action execution.
-- Prevent application-resource writes, hook execution, and volume-data changes in core restore operations and built-in actions, and define the same expectation for explicitly enabled external actions.
+- Prevent application-resource writes, hook execution, and volume-data changes in core restore operations and built-in actions, and define the same expectation for explicitly enabled external actions; keep dry-run and external-plugin settings fixed once processing starts, including on retries.
 - Make the preview available through the existing asynchronous restore workflow and artifact download mechanisms.
 
 ## Non Goals
@@ -30,6 +30,7 @@ As a result, adding a conditional check around `resourceClient.Create` would be 
 - Backup dry run, which can be proposed separately after restore semantics are agreed on.
 - Guaranteed success of a subsequent restore, admission validation, capacity checks, or a transactional plan that can later be applied.
 - Sandboxing plugins that ignore dry-run mode or rolling back their side effects.
+- Changing dry-run or external-plugin settings after a Restore starts, or converting a preview into a real restore; different settings require a new Restore object.
 
 ## High-Level Design
 
