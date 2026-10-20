@@ -33,7 +33,7 @@ As a result, adding a conditional check around `resourceClient.Create` would be 
 
 ## High-Level Design
 
-A dry run creates a normal Restore custom resource with `spec.dryRun: true`.
+A dry run creates a normal Restore custom resource with `spec.dryRun.enabled: true`.
 The server downloads the backup and evaluates the restore against the target cluster, using a planning execution mode at every operation that would change application or volume state.
 It records intended actions rather than issuing those operations.
 The Restore object, its status, preview artifacts in backup storage, and temporary local files are permitted bookkeeping writes.
@@ -42,41 +42,55 @@ Core planning operations must not create, patch, update, or delete any applicati
 Explicitly enabled restore actions are expected to honor the same restriction, but Velero cannot enforce it inside plugin processes.
 
 Dry runs skip all RestoreItemActions by default, including built-in actions, and clearly identify the preview as incomplete because plugin transformations, additional items, and skip decisions are missing.
-Users can opt in with `--run-plugins` once they have verified that their installed restore plugins honor `restore.spec.dryRun`.
-When enabled, actions still transform objects, return additional items, and decide `SkipRestore`, but must avoid external side effects when `restore.spec.dryRun` is true.
+Users can opt in with `--run-plugins` once they have verified that their installed restore plugins honor `restore.spec.dryRun.enabled`.
+When enabled, actions still transform objects, return additional items, and decide `SkipRestore`, but must avoid external side effects when `restore.spec.dryRun.enabled` is true.
 The opt-in is a user assertion about plugin behavior; Velero does not automatically verify plugin support or prevent a plugin that ignores the field from making changes.
 
 ## Detailed Design
 
 ### Restore API and CLI
 
-Add the following fields to `RestoreSpec` in `pkg/apis/velero/v1/restore_types.go`:
+Add an optional configuration field to `RestoreSpec` and a new `RestoreDryRunConfig` type in `pkg/apis/velero/v1/restore_types.go`:
 
 ```go
-// DryRun evaluates the restore and records planned actions without restoring
-// application resources or volume data. Velero still persists the Restore
-// object, its status, logs, results, and resource list.
-// +optional
-DryRun bool `json:"dryRun,omitempty"`
+type RestoreSpec struct {
+    // ... existing fields ...
 
-// RunPlugins enables RestoreItemActions during a dry run. Users must verify
-// that installed actions honor DryRun before enabling this option.
-// Has no effect on ordinary restores, which always run applicable actions.
-// +optional
-RunPlugins bool `json:"runPlugins,omitempty"`
+    // DryRun configures restore preview evaluation. Velero still persists
+    // the Restore object, its status, logs, results, and resource list.
+    // +optional
+    DryRun *RestoreDryRunConfig `json:"dryRun,omitempty"`
+}
+
+type RestoreDryRunConfig struct {
+    // Enabled evaluates planned actions without restoring application
+    // resources or volume data through core restore operations.
+    // +optional
+    Enabled bool `json:"enabled,omitempty"`
+
+    // RunPlugins enables RestoreItemActions during a dry run. Users must
+    // verify that installed actions honor Enabled before enabling this option.
+    // Requires Enabled to be true.
+    // +optional
+    RunPlugins bool `json:"runPlugins,omitempty"`
+}
 ```
 
-Omitted or false `dryRun` preserves normal restore behavior, including plugin execution regardless of `runPlugins`.
-For a dry run, omitted or false `runPlugins` skips restore actions; true enables them.
+Omitting `dryRun`, using an empty object, or setting `dryRun.enabled: false` preserves normal restore behavior, including execution of applicable restore actions.
+Both nested booleans default to false when omitted.
+For an enabled dry run, omitted or false `dryRun.runPlugins` skips restore actions; true enables them.
+Reject `dryRun.runPlugins: true` unless `dryRun.enabled` is true, including for direct API submissions, using CRD schema validation and controller validation.
+Keep dry-run-only settings under this configuration object so they do not appear to control ordinary restores.
 Regenerate the Restore CRD and generated API documentation and add matching RestoreBuilder methods.
-Treat the execution mode as fixed once processing starts; reject changes to `spec.dryRun` and `spec.runPlugins` after the initial phase so a preview cannot become a real restore or enable plugins on retry.
+Treat the execution mode as fixed once processing starts; reject changes to the entire `spec.dryRun` configuration after the initial phase so a preview cannot become a real restore or enable plugins on retry.
 Controllers must retain the original execution mode throughout a processing attempt.
 
-Bind a boolean `--dry-run` flag in `pkg/cmd/cli/restore/create.go` and copy it to the Restore spec.
+Bind a boolean `--dry-run` flag in `pkg/cmd/cli/restore/create.go` and map it to `spec.dryRun.enabled`.
 The help text must explain that this submits a server-side preview and persists its results.
-Bind a boolean `--run-plugins` flag, default false, and copy it to `spec.runPlugins`.
+Bind a boolean `--run-plugins` flag, default false, and map it to `spec.dryRun.runPlugins`.
+Leave the configuration pointer nil for ordinary CLI restores and allocate it when `--dry-run` is enabled.
 Reject an explicitly supplied `--run-plugins` flag without `--dry-run` to avoid suggesting that it controls plugins during ordinary restores.
-Its help text must state that users should enable it only after verifying that installed restore actions honor `spec.dryRun`.
+Its help text must state that users should enable it only after verifying that installed restore actions honor `spec.dryRun.enabled`.
 Existing `--wait` behavior applies to the preview, and output should identify the request as a dry run.
 Existing manifest output flags continue to render a Restore manifest; rendering a manifest does not execute the preview.
 
@@ -93,6 +107,15 @@ velero restore logs preview-1
 # Run a new preview after verifying that installed restore actions honor dryRun.
 velero restore create preview-2 --from-backup backup-1 \
   --dry-run --run-plugins --wait
+```
+
+The corresponding dry-run configuration in a Restore manifest is:
+
+```yaml
+spec:
+  dryRun:
+    enabled: true
+    runPlugins: true
 ```
 
 `restore get` and `restore describe` must visibly identify dry runs, including in structured describe output where applicable.
@@ -144,15 +167,15 @@ A preview with such gaps must not be presented as a fully evaluated restore, whe
 
 ### Plugin contract
 
-The Restore already travels in `RestoreItemActionExecuteInput`, so updated plugins can read `input.Restore.Spec.DryRun` without changing the Execute payload.
+The Restore already travels in `RestoreItemActionExecuteInput`, so updated plugins can check `input.Restore.Spec.DryRun != nil && input.Restore.Spec.DryRun.Enabled` without changing the Execute payload.
 No capability RPC or new plugin interface is required in the initial implementation.
-For a dry run with `runPlugins` false, bypass restore-action loading, selector resolution, and execution so skipped restore actions do not run setup or AppliesTo code either.
+For a dry run with `dryRun.runPlugins` false, bypass restore-action loading, selector resolution, and execution so skipped restore actions do not run setup or AppliesTo code either.
 ObjectStore access remains enabled because the server needs to read backups and persist preview artifacts, including when a plugin binary also provides restore actions.
 
-For a dry run with `runPlugins` true, resolve and invoke applicable restore actions through the existing plugin workflow.
-Before submission, print a notice that plugin execution is enabled and that plugins which ignore `spec.dryRun` may make real changes.
+For a dry run with `dryRun.runPlugins` true, resolve and invoke applicable restore actions through the existing plugin workflow.
+Before submission, print a notice that plugin execution is enabled and that plugins which ignore `spec.dryRun.enabled` may make real changes.
 Do not require an additional confirmation prompt; the explicit flag records the user's choice.
-Document the same requirement for direct API clients setting `spec.runPlugins`.
+Document the same requirement for direct API clients setting `spec.dryRun.runPlugins`.
 Plugin authors should document dry-run support and ensure plugin setup and selector resolution are side-effect free, and that dry-run Execute only performs reads and in-memory transformations.
 Plugins must preserve `UpdatedItem`, `AdditionalItems`, and `SkipRestore` semantics where those decisions can be computed without writes.
 They must not create resources, call cloud mutation APIs, start data transfer, or return an active OperationID.
@@ -190,12 +213,12 @@ Deleting a preview may remove its own stored artifacts through the existing exte
 
 ## Compatibility
 
-Absent or false `dryRun` leaves existing restores and plugin behavior unchanged.
+An absent `dryRun` configuration or a configuration with `enabled` false and `runPlugins` false leaves existing restores and plugin behavior unchanged.
 The API fields, generated schemas, controller behavior, and CLI must ship together.
 Only support previews against servers and CRDs that implement the feature.
 An older CRD can prune an unknown field, and an older server can ignore a preserved field, turning an intended preview into a real restore.
 
-Before submitting a dry run, the CLI must check the server version through ServerStatusRequest against the first supporting release and verify that the installed Restore CRD schema exposes the boolean `spec.dryRun` and `spec.runPlugins` fields.
+Before submitting a dry run, the CLI must check the server version through ServerStatusRequest against the first supporting release and verify that the installed Restore CRD schema exposes an object at `spec.dryRun` with boolean `enabled` and `runPlugins` properties.
 Abort before creating the Restore if either check fails, times out, or cannot be authorized.
 Document the additional read permission needed for this schema check.
 Perform these checks only when submitting a dry run, not when rendering a manifest locally.
@@ -234,13 +257,13 @@ A dry run uses the server's existing permissions to read the backup and inspect 
 Apply existing Restore and DownloadRequest authorization, backup-storage access controls, signed-URL expiry, and log redaction rules.
 Do not persist complete resource bodies, Secret values, credentials, or file contents in the preview list or new log messages.
 The preview intentionally writes its own bookkeeping and does not establish a new read-only authorization boundary for third-party plugin processes.
-With `runPlugins` enabled, honoring `dryRun` is the plugin's responsibility, and Velero cannot guarantee that an incompatible plugin avoids application, cloud, or volume mutations.
+With `dryRun.runPlugins` enabled, honoring `dryRun.enabled` is the plugin's responsibility, and Velero cannot guarantee that an incompatible plugin avoids application, cloud, or volume mutations.
 
 ## Implementation
 
 Implement this proposal after design review in the following order:
 
-1. Add restore-action bypass and opt-in execution paths, and update built-in actions to honor `spec.dryRun` while leaving ordinary restores unchanged.
+1. Add restore-action bypass and opt-in execution paths, and update built-in actions to honor `spec.dryRun.enabled` while leaving ordinary restores unchanged.
 2. Add the Restore API field and generated schemas, and refactor shared restore decisions with explicit planning branches at mutation boundaries.
 3. Integrate controller completion, artifact persistence, preview action strings, and finalizer handling.
 4. Add the CLI flags, compatibility checks, get/describe output, and user and plugin-author documentation.
@@ -254,8 +277,8 @@ Verification must cover:
 - Existing-resource policies, ServiceAccount merging, status restoration, labels, managed fields, generated names, and missing or terminating namespaces with the informer cache enabled and disabled.
 - Native snapshots, CSI snapshots and data movement, file-system restore, dynamic provisioning, and in-place restore, including existing PVCs and read-only preflight failures.
 - Zero restore-action loading, selector resolution, or execution when plugins are skipped, with warnings and visible mode indicators in persisted and CLI output.
-- Opt-in execution for both plugin protocol versions with dry-run-aware actions, SkipRestore, additional items, and erroneous OperationIDs; ordinary restores still execute applicable actions with either runPlugins value.
-- CLI flag validation and persisted runPlugins values, including direct API submission and rejection of execution-mode changes after processing starts.
+- Opt-in execution for both plugin protocol versions with dry-run-aware actions, SkipRestore, additional items, and erroneous OperationIDs; ordinary restores still execute applicable actions when the dryRun configuration is absent or disabled.
+- CLI flag validation and persisted nested dryRun configuration, including omitted and empty objects, direct API submission, rejection of runPlugins without enabled, and rejection of execution-mode changes after processing starts.
 - Missing CRDs and unresolved custom resources without CRD establishment or readiness timeouts.
 - Hook selection with zero exec calls, zero helper workloads, and zero asynchronous operation polling.
 - Full controller and finalizer runs using recording clients that fail unexpected application writes, plus snapshotter and hook fakes that fail unexpected side-effect calls.
